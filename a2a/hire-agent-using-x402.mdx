@@ -49,30 +49,82 @@ You send it a message, it answers `402` with the price, you pay by signing one U
   <Step title="Sign the payment">
     Sign the `accepts[]` row exactly as received. On NEAR it is one delegated `ft_transfer`. A relayer pays the gas.
 
-    ```js
+    <CodeGroup>
+
+    ```javascript Node
     import { connect, KeyPair, keyStores, transactions } from 'near-api-js'
-    
+
     const row = accepts.find((a) => a.network.startsWith('near:'))
     const networkId = row.network.split(':')[1]
-    
+
     const keyStore = new keyStores.InMemoryKeyStore()
     await keyStore.setKey(networkId, ACCOUNT_ID, KeyPair.fromString(PRIVATE_KEY))
-    
+
     const near = await connect({ networkId, nodeUrl: `https://rpc.${networkId}.fastnear.com`, keyStore })
-    
+
     const signed = await (await near.account(ACCOUNT_ID)).signedDelegate({
       receiverId: row.asset,
       blockHeightTtl: row.maxTimeoutSeconds,
       actions: [transactions.functionCall('ft_transfer',
         { receiver_id: row.payTo, amount: row.amount }, 30000000000000n, 1n)],
     })
-    
+
     const payload = {
         signedDelegateAction: Buffer.from(transactions.encodeSignedDelegate(signed)).toString('base64')
     }
-    
+
     const xPayment = Buffer.from(JSON.stringify({ x402Version: 2, accepted: row, payload })).toString('base64')
     ```
+
+    ```python Python
+    import base64, hashlib, json, struct, urllib.request
+    import base58  # pip install base58 pynacl
+    from nacl.signing import SigningKey
+
+    row = next(a for a in accepts if a["network"].startswith("near:"))
+    network_id = row["network"].split(":")[1]
+
+
+    def rpc(method, params):
+        body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        req = urllib.request.Request(f"https://rpc.{network_id}.fastnear.com", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read())["result"]
+
+
+    key = SigningKey(base58.b58decode(PRIVATE_KEY.removeprefix("ed25519:"))[:32])
+    public_key = bytes(key.verify_key)
+    height = rpc("block", {"finality": "final"})["header"]["height"]
+    nonce = rpc("query", {"request_type": "view_access_key", "finality": "optimistic", "account_id": ACCOUNT_ID,
+                          "public_key": "ed25519:" + base58.b58encode(public_key).decode()})["nonce"]
+
+
+    def borsh_string(s):
+        return struct.pack("<I", len(s.encode())) + s.encode()
+
+
+    # The delegate action (NEP-366) in Borsh: one ft_transfer call, 30 Tgas, 1 yoctoNEAR deposit
+    args = json.dumps({"receiver_id": row["payTo"], "amount": row["amount"]}, separators=(",", ":")).encode()
+    ft_transfer = (b"\x02" + borsh_string("ft_transfer") + struct.pack("<I", len(args)) + args
+                   + struct.pack("<Q", 30_000_000_000_000) + (1).to_bytes(16, "little"))
+    delegate_action = (borsh_string(ACCOUNT_ID) + borsh_string(row["asset"])
+                       + struct.pack("<I", 1) + ft_transfer
+                       + struct.pack("<QQ", nonce + 1, height + row["maxTimeoutSeconds"])
+                       + b"\x00" + public_key)
+
+    # NEP-461: sign the SHA-256 of the prefix 2^30 + 366 and the delegate action
+    digest = hashlib.sha256(struct.pack("<I", 2**30 + 366) + delegate_action).digest()
+    signed = delegate_action + b"\x00" + key.sign(digest).signature
+
+    payload = {
+        "signedDelegateAction": base64.b64encode(signed).decode()
+    }
+
+    x_payment = base64.b64encode(json.dumps({"x402Version": 2, "accepted": row, "payload": payload}).encode()).decode()
+    ```
+
+    </CodeGroup>
   </Step>
   <Step title="Pay and get the result">
     Repeat the same request with the header `X-PAYMENT: <xPayment>`. The call blocks up to 60 seconds while the agent works.
